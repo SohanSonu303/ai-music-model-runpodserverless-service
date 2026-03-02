@@ -8,6 +8,7 @@ import requests
 import uuid
 import os
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
+from huggingface_hub import snapshot_download
 from pydub import AudioSegment
 
 # ---------------------------------------------------------
@@ -17,23 +18,30 @@ ALLOWED_API_KEY = os.environ.get("API_SECRET", None)
 if not ALLOWED_API_KEY:
     print("WARNING: Environment variable API_SECRET not set! API will be unprotected.")
 
+# ---------------------------------------------------------
+# LOAD MODEL AT WORKER START (NOT IN DOCKER BUILD)
+# ---------------------------------------------------------
+print("🔥 Initializing worker...")
 
-# ---------------------------------------------------------
-# LOAD MODEL
-# ---------------------------------------------------------
-print("Loading MusicGen...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-LOCAL_MODEL_PATH = "/root/.cache/huggingface/hub/musicgen-melody"
+MODEL_DIR = "/root/.cache/huggingface/hub/musicgen-melody"
 
-processor = AutoProcessor.from_pretrained(LOCAL_MODEL_PATH)
+if not os.path.exists(MODEL_DIR):
+    print("📥 Downloading MusicGen model...")
+    snapshot_download(
+        repo_id="facebook/musicgen-melody",
+        local_dir=MODEL_DIR
+    )
+    print("✅ Model downloaded.")
 
+print("🔧 Loading MusicGen into memory...")
+processor = AutoProcessor.from_pretrained(MODEL_DIR)
 model = MusicgenForConditionalGeneration.from_pretrained(
-    LOCAL_MODEL_PATH,
+    MODEL_DIR,
     torch_dtype=torch.float16 if device == "cuda" else torch.float32
 ).to(device)
-
-print("✅ MusicGen loaded.")
+print("✅ MusicGen ready.")
 
 
 # ---------------------------------------------------------
@@ -52,7 +60,6 @@ def handler(event):
             return {"error": "Missing or invalid Authorization header"}
 
         api_key = auth_header.split(" ")[1]
-
         if api_key != ALLOWED_API_KEY:
             return {"error": "Invalid API Key"}
 
@@ -66,7 +73,7 @@ def handler(event):
     melody = None
 
     # --------------------------------------------
-    # REF AUDIO
+    # OPTIONAL REFERENCE AUDIO
     # --------------------------------------------
     if ref_audio_url:
         audio_bytes = requests.get(ref_audio_url).content
@@ -95,19 +102,12 @@ def handler(event):
     # --------------------------------------------
     # GENERATE AUDIO
     # --------------------------------------------
-    if melody is not None:
-        audio_values = model.generate(
-            **inputs,
-            melody=melody,
-            do_sample=True,
-            max_new_tokens=32000 * duration
-        )
-    else:
-        audio_values = model.generate(
-            **inputs,
-            do_sample=True,
-            max_new_tokens=32000 * duration
-        )
+    audio_values = model.generate(
+        **inputs,
+        melody=melody,
+        do_sample=True,
+        max_new_tokens=32000 * duration
+    )
 
     # --------------------------------------------
     # ENCODE WAV

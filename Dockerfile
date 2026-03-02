@@ -18,18 +18,6 @@ COPY requirements.txt .
 RUN pip3 install --upgrade pip
 RUN pip3 install -r requirements.txt
 
-# ---------------------------------------------------------
-# PRE-DOWNLOAD MUSICGEN MODEL INTO DOCKER IMAGE
-# ---------------------------------------------------------
-RUN python3 - <<EOF
-from huggingface_hub import snapshot_download
-print("📥 Downloading MusicGen model...")
-snapshot_download(
-    repo_id="facebook/musicgen-melody",
-    local_dir="/root/.cache/huggingface/hub/musicgen-melody"
-)
-print("✅ Model downloaded successfully.")
-EOF
 
 # Copy handler
 COPY runpod_handler.py .
