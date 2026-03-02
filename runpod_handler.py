@@ -6,14 +6,22 @@ import base64
 import io
 import requests
 import uuid
+import os
 from transformers import AutoProcessor, MusicgenForConditionalGeneration
 from pydub import AudioSegment
 
 # ---------------------------------------------------------
-# LOAD MODEL FROM LOCAL CACHE (PRE-BAKED)
+# 🔐 AUTH USING ENV VARIABLE
 # ---------------------------------------------------------
-print("Loading MusicGen from local Docker cache...")
+ALLOWED_API_KEY = os.environ.get("API_SECRET", None)
+if not ALLOWED_API_KEY:
+    print("WARNING: Environment variable API_SECRET not set! API will be unprotected.")
 
+
+# ---------------------------------------------------------
+# LOAD MODEL
+# ---------------------------------------------------------
+print("Loading MusicGen...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 LOCAL_MODEL_PATH = "/root/.cache/huggingface/hub/musicgen-melody"
@@ -25,19 +33,41 @@ model = MusicgenForConditionalGeneration.from_pretrained(
     torch_dtype=torch.float16 if device == "cuda" else torch.float32
 ).to(device)
 
-print("✅ MusicGen ready.")
+print("✅ MusicGen loaded.")
+
 
 # ---------------------------------------------------------
-# HANDLER FUNCTION
+# HANDLER
 # ---------------------------------------------------------
 def handler(event):
-    prompt = event.get("prompt", "ambient music")
-    duration = event.get("duration", 30)
+
+    # --------------------------------------------
+    # 🔐 Authorization (env-based)
+    # --------------------------------------------
+    if ALLOWED_API_KEY:
+        headers = event.get("headers", {}) or {}
+        auth_header = headers.get("Authorization") or headers.get("authorization")
+
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return {"error": "Missing or invalid Authorization header"}
+
+        api_key = auth_header.split(" ")[1]
+
+        if api_key != ALLOWED_API_KEY:
+            return {"error": "Invalid API Key"}
+
+    # --------------------------------------------
+    # INPUTS
+    # --------------------------------------------
+    prompt = event.get("prompt", "calm ambient music")
+    duration = int(event.get("duration", 20))
     ref_audio_url = event.get("ref_audio", None)
 
     melody = None
 
-    # Optional reference audio
+    # --------------------------------------------
+    # REF AUDIO
+    # --------------------------------------------
     if ref_audio_url:
         audio_bytes = requests.get(ref_audio_url).content
         temp_path = f"/tmp/ref_{uuid.uuid4()}.wav"
@@ -52,7 +82,9 @@ def handler(event):
         melody, sr = torchaudio.load(temp_path)
         melody = melody.to(device)
 
-    # Prepare inputs
+    # --------------------------------------------
+    # PROCESS INPUTS
+    # --------------------------------------------
     inputs = processor(
         text=[prompt],
         padding=True,
@@ -60,33 +92,39 @@ def handler(event):
         sampling_rate=32000
     ).to(device)
 
-    # Generate
+    # --------------------------------------------
+    # GENERATE AUDIO
+    # --------------------------------------------
     if melody is not None:
         audio_values = model.generate(
             **inputs,
             melody=melody,
-            do_sample=True
+            do_sample=True,
+            max_new_tokens=32000 * duration
         )
     else:
         audio_values = model.generate(
             **inputs,
-            do_sample=True
+            do_sample=True,
+            max_new_tokens=32000 * duration
         )
 
-    # Convert to WAV in memory
+    # --------------------------------------------
+    # ENCODE WAV
+    # --------------------------------------------
     audio = audio_values[0].cpu().numpy()
     buffer = io.BytesIO()
     sf.write(buffer, audio.T, 32000, format="WAV")
     buffer.seek(0)
 
-    audio_b64 = base64.b64encode(buffer.read()).decode("utf-8")
+    audio_b64 = base64.b64encode(buffer.read()).decode()
 
     return {
         "status": "success",
         "prompt": prompt,
-        "duration": duration,
         "audio_base64": audio_b64
     }
+
 
 # ---------------------------------------------------------
 # START SERVERLESS
