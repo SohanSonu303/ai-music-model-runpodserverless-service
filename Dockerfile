@@ -3,6 +3,7 @@ FROM nvidia/cuda:12.6.0-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/root/.cache/huggingface \
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
     PATH="/root/.local/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,8 +28,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 # uv automatically handles local sources (like nano-vllm) and PyTorch indices defined in pyproject.toml
 RUN uv pip install -e .
 
-# Add RunPod + I/O extras
-RUN uv pip install runpod requests soundfile
+# Add RunPod + I/O extras + hf_transfer for blazing fast model downloads
+RUN uv pip install runpod requests soundfile hf_transfer
 
 # Bake DiT weights (4B XL SFT — best quality) into HF cache so initialize_service
 # finds them instantly; no download on cold-start.
