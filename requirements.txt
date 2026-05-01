@@ -1,10 +1,6 @@
-torch
-torchaudio
-transformers
-accelerate
-einops
+# ACE-Step's own deps (torch, transformers, torchcodec, etc.) are managed by
+# uv sync against the cloned repo's pyproject.toml. Only RunPod-specific
+# extras are listed here for reference — they're installed via uv pip install.
 runpod
-pydub
-soundfile
-huggingface_hub
 requests
+soundfile

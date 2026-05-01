@@ -1,128 +1,148 @@
-import runpod
-import torch
-import torchaudio
-import soundfile as sf
 import base64
 import io
-import requests
-import uuid
 import os
-from transformers import AutoProcessor, MusicgenForConditionalGeneration
-from huggingface_hub import snapshot_download
-from pydub import AudioSegment
+import uuid
+
+import requests
+import runpod
+import soundfile as sf
+import torch
+
+from acestep.handler import AceStepHandler
+from acestep.llm_inference import LLMHandler
+from acestep.inference import generate_music, GenerationParams, GenerationConfig
 
 # ---------------------------------------------------------
-# 🔐 AUTH USING ENV VARIABLE
+# AUTH
 # ---------------------------------------------------------
-ALLOWED_API_KEY = os.environ.get("API_SECRET", None)
+ALLOWED_API_KEY = os.environ.get("API_SECRET")
 if not ALLOWED_API_KEY:
-    print("WARNING: Environment variable API_SECRET not set! API will be unprotected.")
+    print("WARNING: API_SECRET not set — endpoint is unprotected.")
 
 # ---------------------------------------------------------
-# LOAD MODEL AT WORKER START (NOT IN DOCKER BUILD)
+# DiT HANDLER (loads once at worker cold-start)
 # ---------------------------------------------------------
-print("🔥 Initializing worker...")
+ACESTEP_CONFIG = os.environ.get("ACESTEP_CONFIG", "acestep-v15-xl-sft")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Loading ACE-Step DiT ({ACESTEP_CONFIG}) on {DEVICE}...")
+dit_handler = AceStepHandler()
+dit_handler.initialize_service(
+    project_root="/app",
+    config_path=ACESTEP_CONFIG,
+    device=DEVICE,
+)
+print("DiT ready.")
 
-MODEL_DIR = "/root/.cache/huggingface/hub/musicgen-melody"
+# ---------------------------------------------------------
+# LM HANDLER (optional — skipped if checkpoint absent)
+# LM adds 5Hz musical-structure codes for text2music quality.
+# Not used for cover tasks (ACE-Step skips it automatically).
+# ---------------------------------------------------------
+LM_CHECKPOINT_DIR = os.environ.get("LM_CHECKPOINT_DIR", "/app/checkpoints")
+LM_MODEL_PATH = os.environ.get("LM_MODEL_PATH", "acestep-5Hz-lm-0.6B")
 
-if not os.path.exists(MODEL_DIR):
-    print("📥 Downloading MusicGen model...")
-    snapshot_download(
-        repo_id="facebook/musicgen-melody",
-        local_dir=MODEL_DIR
+_lm_full_path = os.path.join(LM_CHECKPOINT_DIR, LM_MODEL_PATH)
+if os.path.isdir(_lm_full_path):
+    print(f"Loading LM ({LM_MODEL_PATH}) on {DEVICE}...")
+    llm_handler = LLMHandler()
+    llm_handler.initialize(
+        checkpoint_dir=LM_CHECKPOINT_DIR,
+        lm_model_path=LM_MODEL_PATH,
+        backend="pt",
+        device=DEVICE,
     )
-    print("✅ Model downloaded.")
+    print("LM ready.")
+else:
+    print(f"LM checkpoint not found at {_lm_full_path} — running DiT-only.")
+    llm_handler = None
 
-print("🔧 Loading MusicGen into memory...")
-processor = AutoProcessor.from_pretrained(MODEL_DIR)
-model = MusicgenForConditionalGeneration.from_pretrained(
-    MODEL_DIR,
-    torch_dtype=torch.float16 if device == "cuda" else torch.float32
-).to(device)
-print("✅ MusicGen ready.")
+SAMPLE_RATE = 48000  # ACE-Step normalises output to stereo 48 kHz
+
+# ---------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------
+def _auth_ok(event):
+    if not ALLOWED_API_KEY:
+        return True
+    headers = event.get("headers") or {}
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    return auth.startswith("Bearer ") and auth.split(" ", 1)[1] == ALLOWED_API_KEY
+
+
+def _download_ref(url):
+    path = f"/tmp/ref_{uuid.uuid4().hex}.wav"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    with open(path, "wb") as f:
+        f.write(r.content)
+    return path
 
 
 # ---------------------------------------------------------
 # HANDLER
 # ---------------------------------------------------------
 def handler(event):
+    if not _auth_ok(event):
+        return {"error": "Invalid or missing Authorization header"}
 
-    # --------------------------------------------
-    # 🔐 Authorization (env-based)
-    # --------------------------------------------
-    if ALLOWED_API_KEY:
-        headers = event.get("headers", {}) or {}
-        auth_header = headers.get("Authorization") or headers.get("authorization")
+    # RunPod wraps payload under "input"; also accept flat payload for local testing
+    inp = event.get("input", event)
+    prompt = inp.get("prompt", "calm ambient music")
+    duration = float(inp.get("duration", 30))
+    guidance_scale = float(inp.get("guidance_scale", 7.5))
+    seed = inp.get("seed")
+    instrumental = bool(inp.get("instrumental", True))
+    bpm = inp.get("bpm")
+    ref_audio_url = inp.get("ref_audio")
 
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return {"error": "Missing or invalid Authorization header"}
+    task_type = "cover" if ref_audio_url else "text2music"
+    reference_audio = _download_ref(ref_audio_url) if ref_audio_url else None
 
-        api_key = auth_header.split(" ")[1]
-        if api_key != ALLOWED_API_KEY:
-            return {"error": "Invalid API Key"}
-
-    # --------------------------------------------
-    # INPUTS
-    # --------------------------------------------
-    prompt = event.get("prompt", "calm ambient music")
-    duration = int(event.get("duration", 20))
-    ref_audio_url = event.get("ref_audio", None)
-
-    melody = None
-
-    # --------------------------------------------
-    # OPTIONAL REFERENCE AUDIO
-    # --------------------------------------------
-    if ref_audio_url:
-        audio_bytes = requests.get(ref_audio_url).content
-        temp_path = f"/tmp/ref_{uuid.uuid4()}.wav"
-
-        with open(temp_path, "wb") as f:
-            f.write(audio_bytes)
-
-        audio = AudioSegment.from_file(temp_path)
-        audio = audio.set_channels(1).set_frame_rate(32000)
-        audio.export(temp_path, format="wav")
-
-        melody, sr = torchaudio.load(temp_path)
-        melody = melody.to(device)
-
-    # --------------------------------------------
-    # PROCESS INPUTS
-    # --------------------------------------------
-    inputs = processor(
-        text=[prompt],
-        padding=True,
-        return_tensors="pt",
-        sampling_rate=32000
-    ).to(device)
-
-    # --------------------------------------------
-    # GENERATE AUDIO
-    # --------------------------------------------
-    audio_values = model.generate(
-        **inputs,
-        melody=melody,
-        do_sample=True,
-        max_new_tokens=32000 * duration
+    params = GenerationParams(
+        task_type=task_type,
+        caption=prompt,
+        duration=duration,
+        reference_audio=reference_audio,
+        instrumental=instrumental,
+        bpm=bpm,
+        guidance_scale=guidance_scale,
+        seed=seed,
     )
+    config = GenerationConfig(batch_size=1, audio_format="wav")
 
-    # --------------------------------------------
-    # ENCODE WAV
-    # --------------------------------------------
-    audio = audio_values[0].cpu().numpy()
-    buffer = io.BytesIO()
-    sf.write(buffer, audio.T, 32000, format="WAV")
-    buffer.seek(0)
+    result = generate_music(dit_handler, llm_handler, params, config, save_dir="/tmp")
 
-    audio_b64 = base64.b64encode(buffer.read()).decode()
+    if not result.success:
+        return {"error": result.error or "Generation failed"}
+
+    audio_dict = result.audios[0]
+    audio_tensor = audio_dict["tensor"]  # [channels, samples], CPU float32
+
+    # Clean up temp files written by generate_music
+    audio_path = audio_dict.get("path")
+    if audio_path and os.path.exists(audio_path):
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+    if reference_audio and os.path.exists(reference_audio):
+        try:
+            os.unlink(reference_audio)
+        except OSError:
+            pass
+
+    buf = io.BytesIO()
+    sf.write(buf, audio_tensor.numpy().T, SAMPLE_RATE, format="WAV")
+    buf.seek(0)
 
     return {
         "status": "success",
+        "task": task_type,
         "prompt": prompt,
-        "audio_base64": audio_b64
+        "duration": duration,
+        "sample_rate": SAMPLE_RATE,
+        "audio_base64": base64.b64encode(buf.read()).decode(),
     }
 
 
